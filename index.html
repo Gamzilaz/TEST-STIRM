@@ -1,0 +1,298 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Decentral P2P Stream — TONKeeper + GunDB + WebRTC (Prototype)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Inter, system-ui, sans-serif; padding: 16px; max-width: 980px; margin: auto; }
+    button { padding: 8px 12px; margin: 6px; }
+    textarea { width: 100%; height: 120px; }
+    #videos { display:flex; gap:10px; margin-top:12px; }
+    video { width:48%; background:#000; }
+    input[type=text] { width: 100%; padding:8px; }
+    .small { font-size: 0.9em; color: #666; }
+    .row { display:flex; gap:8px; align-items:center; }
+    .col { display:flex; flex-direction:column; gap:6px; }
+  </style>
+</head>
+<body>
+  <h2>Decentral P2P Stream — TONKeeper + GunDB + WebRTC (Prototype)</h2>
+
+  <p class="small">Прототип: вход через TON Connect (TONKeeper), сигналинг через GunDB, медиа — P2P WebRTC. Для демо — бесплатно, без сервера. Для устойчивой работы в некоторых сетях понадобится TURN-сервер.</p>
+
+  <div class="row">
+    <button id="btnConnectWallet">Connect TON Wallet (TON Connect / TonKeeper)</button>
+    <span id="walletInfo" class="small"></span>
+  </div>
+
+  <div class="col">
+    <div>
+      <button id="btnCreateRoom">Create Room</button>
+      <button id="btnLeaveRoom">Leave Room</button>
+    </div>
+
+    <div>
+      <p><b>Your room ID</b> (share with friend)</p>
+      <input id="roomId" readonly />
+    </div>
+
+    <div>
+      <p><b>Join room</b></p>
+      <div class="row">
+        <input id="joinRoomId" placeholder="enter room id" />
+        <button id="btnJoinRoom">Join</button>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <p><b>Logs</b></p>
+    <textarea id="log" readonly></textarea>
+  </div>
+
+  <div id="videos">
+    <video id="localVideo" autoplay muted playsinline></video>
+    <video id="remoteVideo" autoplay playsinline></video>
+  </div>
+
+  <!-- Dependencies -->
+  <!-- GunDB -->
+  <script src="https://cdn.jsdelivr.net/npm/gun/gun.min.js"></script>
+  <!-- TonConnect SDK (UMD) -->
+  <script src="https://unpkg.com/@tonconnect/sdk@1.12.0/dist/tonconnect.umd.js"></script>
+
+  <script>
+  (async function(){
+    const L = (...a) => { const el=document.getElementById('log'); el.value += a.join(' ') + '\n'; el.scrollTop = el.scrollHeight; console.log(...a); };
+
+    // --- CONFIG ---
+    // Gun peers: public peers help bootstrap. You can add more or run your own.
+    const GUN_PEERS = [
+      'https://gun-manhattan.herokuapp.com/gun' // public example relay (may be intermittent). Add other peers if needed.
+    ];
+
+    // STUN servers (public) — TURN recommended for prod
+    const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+    // --- STATE ---
+    let tonConnect = null;
+    let account = null; // {address, ...}
+    let gun = null;
+    let room = null; // gun node for room
+    let pc = null;
+    let localStream = null;
+    let isInitiator = false;
+    let myId = null; // derived from wallet (address)
+
+    // UI elements
+    const btnConnectWallet = document.getElementById('btnConnectWallet');
+    const walletInfo = document.getElementById('walletInfo');
+    const btnCreateRoom = document.getElementById('btnCreateRoom');
+    const btnLeaveRoom = document.getElementById('btnLeaveRoom');
+    const roomIdInput = document.getElementById('roomId');
+    const joinRoomId = document.getElementById('joinRoomId');
+    const btnJoinRoom = document.getElementById('btnJoinRoom');
+    const localVideo = document.getElementById('localVideo');
+    const remoteVideo = document.getElementById('remoteVideo');
+
+    // --- TON Connect (TONKeeper) ---
+    async function initTonConnect(){
+      // TonConnect SDK (UMD) exposes TonConnect
+      if (!window.TonConnect) {
+        L('TonConnect sdk not found');
+        return;
+      }
+      tonConnect = new TonConnect.TonConnect({ manifestUrl: "https://gamzilaz.github.io/gamz-test-strim/tonconnect-manifest.json" });
+
+      // If wallet already connected (cached), restore
+      if (tonConnect.connected) {
+        account = tonConnect.account; // {address}
+        myId = account.address;
+        walletInfo.innerText = myId;
+        L('Wallet restored:', myId);
+      }
+
+      // listen for status changes
+      tonConnect.onStatusChange((wallet) => {
+        if (wallet) {
+          account = tonConnect.account;
+          myId = account.address;
+          walletInfo.innerText = myId;
+          L('Wallet connected:', myId);
+        } else {
+          account = null; myId = null; walletInfo.innerText = '';
+          L('Wallet disconnected');
+        }
+      });
+    }
+
+    btnConnectWallet.onclick = async () => {
+      try {
+        if (!tonConnect) await initTonConnect();
+        if (!tonConnect) return alert('TonConnect not available');
+        if (!tonConnect.connected) {
+          await tonConnect.requestConnection(); // opens TonKeeper and asks connect
+          // after connection, account will be available via event above
+        } else {
+          L('Already connected');
+        }
+      } catch(e){ L('TonConnect error:', e); alert('Wallet connect failed'); }
+    };
+
+    // --- GunDB init ---
+    function initGun(){
+      if (gun) return gun;
+      L('Initializing GunDB with peers:', GUN_PEERS.join(', '));
+      gun = Gun({ peers: GUN_PEERS });
+      return gun;
+    }
+
+    // --- Media ---
+    async function startLocalMedia(){
+      if (localStream) return localStream;
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
+        localVideo.srcObject = localStream;
+        L('Local media started');
+        return localStream;
+      } catch(e){ L('getUserMedia error', e); alert('Allow camera/mic'); throw e; }
+    }
+
+    // --- WebRTC helpers ---
+    async function createPeerConnection(){
+      pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      pc.ontrack = e => { L('ontrack'); remoteVideo.srcObject = e.streams[0]; };
+      pc.onicecandidate = e => {
+        if (!e.candidate) return;
+        L('local ICE candidate:', e.candidate.candidate.slice(0,80)+'...');
+        // push candidate to GunDB (room.candidates set)
+        if (room) {
+          const c = { from: myId, candidate: e.candidate }; // candidate is an object
+          room.get('candidates').set(c);
+        }
+      };
+
+      // when remote say data channel message
+      pc.ondatachannel = ev => {
+        const ch = ev.channel;
+        ch.onmessage = m => L('DC recv:', m.data);
+      };
+
+      // add local tracks
+      await startLocalMedia();
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+      return pc;
+    }
+
+    // --- Room logic ---
+    function makeRoomNode(id){
+      initGun();
+      return gun.get('room-'+id);
+    }
+
+    btnCreateRoom.onclick = async () => {
+      if (!myId) return alert('Connect wallet first');
+      const id = Math.random().toString(36).slice(2,8);
+      roomIdInput.value = id;
+      room = makeRoomNode(id);
+      isInitiator = true;
+      L('Room created:', id);
+
+      // listen to candidates from peer
+      room.get('candidates').map().on(async (c) => {
+        try {
+          if (!c) return;
+          if (c.from === myId) return; // ignore my own
+          if (!pc) { L('Got candidate but pc not ready yet'); return; }
+          L('Remote ICE candidate recv');
+          await pc.addIceCandidate(c.candidate);
+        } catch(e){ L('addIceCandidate err', e); }
+      });
+
+      // listen for answer
+      room.get('answer').on(async (a) => {
+        if (!a) return;
+        if (!a.sdp) return;
+        L('Answer received');
+        if (!pc) L('pc missing when answer arrived');
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription({ type:'answer', sdp: a.sdp }));
+          L('Remote description set (answer)');
+        } catch(e){ L('setRemoteDescription error', e); }
+      });
+
+      // create offer and publish
+      await createPeerConnection();
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const payload = { from: myId, sdp: offer.sdp, ts: Date.now() };
+      room.get('offer').put(payload);
+      L('Offer published to room (via GunDB)');
+    };
+
+    btnJoinRoom.onclick = async () => {
+      if (!myId) return alert('Connect wallet first');
+      const id = joinRoomId.value.trim();
+      if (!id) return alert('Enter room id');
+      roomIdInput.value = id; // show joined
+      room = makeRoomNode(id);
+      isInitiator = false;
+      L('Joining room', id);
+
+      // listen to candidates
+      room.get('candidates').map().on(async (c) => {
+        try {
+          if (!c) return;
+          if (c.from === myId) return;
+          if (!pc) { L('candidate arrived but pc not ready'); return; }
+          L('Remote ICE candidate arrived');
+          await pc.addIceCandidate(c.candidate);
+        } catch(e){ L('addIceCandidate err', e); }
+      });
+
+      // listen for offer
+      room.get('offer').on(async (offer) => {
+        if (!offer || !offer.sdp) return;
+        L('Offer received from', offer.from);
+        // create pc, set remote, create answer
+        await createPeerConnection();
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription({ type:'offer', sdp: offer.sdp }));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          const payload = { from: myId, sdp: answer.sdp, ts: Date.now() };
+          room.get('answer').put(payload);
+          L('Answer published to room');
+        } catch(e){ L('error handling offer', e); }
+      });
+
+      // Also listen for answer (in case joiner created offer?)
+      room.get('answer').on(async (a) => {
+        if (!a || !a.sdp) return;
+        if (!pc) { L('Answer arrived but pc missing'); return; }
+        L('Answer received (join flow)');
+        try { await pc.setRemoteDescription(new RTCSessionDescription({ type:'answer', sdp: a.sdp })); } catch(e){ L('setRemoteDescription err', e); }
+      });
+
+      L('Subscribed to room events');
+    };
+
+    btnLeaveRoom.onclick = async () => {
+      L('Leaving room');
+      try { if (pc) pc.close(); } catch(e){}
+      pc = null; room = null; roomIdInput.value = ''; joinRoomId.value = '';
+    };
+
+    // --- Boot ---
+    await initTonConnect();
+    initGun();
+    L('Prototype ready. Connect wallet and start.');
+
+    // Notes for user
+    L('Notes: If connection fails in restrictive networks, you may need a TURN server. GunDB peers are public and may be intermittent; you can add peers or run your own.');
+
+  })();
+  </script>
+</body>
+</html>
